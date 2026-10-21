@@ -12,7 +12,7 @@ from src.utils import set_parameter_vector
 
 START_STEP = 6000
 
-NUM_FLOW_STEPS = 10
+NUM_FLOW_STEPS = 50
 
 # Same convention as the official minimal implementation:
 # four substeps per GD-equivalent time unit.
@@ -129,7 +129,7 @@ def main():
     )
 
     # Use GD midpoint as Central Flow initial center
-    weights = empirical_midpoint(
+    weights = get_saved_weight(
         gd_data,
         START_STEP,
     ).to(device)
@@ -235,7 +235,7 @@ def main():
 
         distance = torch.norm(
             weights - gd_midpoint
-        ).item()
+)       .item()
 
         center_loss = loss_at_weights(
             model,
