@@ -1,0 +1,15 @@
+SEED = 0
+
+DATA_DIR = "./data"
+
+NUM_SAMPLES = 1000
+
+INPUT_DIM = 3 * 32 * 32
+HIDDEN_DIM = 50
+NUM_CLASSES = 10
+
+LR = 0.025
+
+GD_STEPS = 26000
+
+DEVICE = "cpu"
