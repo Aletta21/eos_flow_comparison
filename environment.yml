@@ -1,0 +1,13 @@
+name: eos-flows
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - matplotlib
+  - ipykernel
+  - scikit-learn
+  - jupyterlab
+  - numpy
+  - scipy
+prefix: /Users/alessandra/miniforge3/envs/eos-flows
