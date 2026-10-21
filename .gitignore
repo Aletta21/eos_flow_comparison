@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Conda / virtual environments
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Dataset
+data/
+
+# Generated experiment outputs
+outputs/checkpoints/
+outputs/trajectories/
+
+# Optional: generated figures
+# outputs/figures/
+
+# PyTorch checkpoints
+*.pt
+*.pth
+*.ckpt
