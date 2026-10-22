@@ -1,7 +1,14 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
 from src.utils import set_parameter_vector
+
+
+# ============================================================
+# LOSS + GRADIENT
+# ============================================================
 
 
 def loss_and_gradient(
@@ -9,13 +16,12 @@ def loss_and_gradient(
     weights,
     x,
     targets,
-    create_graph=False,
 ):
-    """
-    Full-batch MSE loss and flattened gradient.
-    """
 
-    set_parameter_vector(model, weights)
+    set_parameter_vector(
+        model,
+        weights,
+    )
 
     model.zero_grad()
 
@@ -26,19 +32,31 @@ def loss_and_gradient(
         targets,
     )
 
-    params = tuple(model.parameters())
+    params = tuple(
+        model.parameters()
+    )
 
     grads = torch.autograd.grad(
         loss,
         params,
-        create_graph=create_graph,
     )
 
-    flat_grad = torch.cat(
-        [g.reshape(-1) for g in grads]
+    gradient = torch.cat(
+        [
+            g.reshape(-1)
+            for g in grads
+        ]
     )
 
-    return loss, flat_grad
+    return (
+        loss.item(),
+        gradient.detach(),
+    )
+
+
+# ============================================================
+# HESSIAN VECTOR PRODUCT
+# ============================================================
 
 
 def hessian_vector_product(
@@ -47,13 +65,12 @@ def hessian_vector_product(
     vector,
     x,
     targets,
-    create_graph=False,
 ):
-    """
-    Compute H @ vector without forming H.
-    """
 
-    set_parameter_vector(model, weights)
+    set_parameter_vector(
+        model,
+        weights,
+    )
 
     model.zero_grad()
 
@@ -64,7 +81,9 @@ def hessian_vector_product(
         targets,
     )
 
-    params = tuple(model.parameters())
+    params = tuple(
+        model.parameters()
+    )
 
     grads = torch.autograd.grad(
         loss,
@@ -73,107 +92,227 @@ def hessian_vector_product(
     )
 
     flat_grad = torch.cat(
-        [g.reshape(-1) for g in grads]
+        [
+            g.reshape(-1)
+            for g in grads
+        ]
     )
 
-    grad_dot_v = torch.dot(
+    directional_derivative = torch.dot(
         flat_grad,
         vector,
     )
 
     hv = torch.autograd.grad(
-        grad_dot_v,
+        directional_derivative,
         params,
-        create_graph=create_graph,
     )
 
     flat_hv = torch.cat(
-        [h.reshape(-1) for h in hv]
+        [
+            h.reshape(-1)
+            for h in hv
+        ]
     )
 
-    return flat_hv
+    return flat_hv.detach()
 
 
-def top_eigenpair_warmstart(
+# ============================================================
+# MULTIPLE HESSIAN EIGENVECTORS
+# ============================================================
+
+
+def top_eigenspace(
     model,
     weights,
     x,
     targets,
-    v=None,
-    num_iters=10,
+    n_eig=6,
+    warm_U=None,
+    num_iters=8,
 ):
     """
-    Power iteration for the top Hessian eigenpair.
+    HVP-based block subspace iteration.
 
-    Reuses the previous eigenvector as a warm start.
+    This tracks several dominant Hessian eigendirections
+    simultaneously.
+
+    warm_U lets us reuse the previous Central Flow
+    eigenspace as initialization.
     """
 
-    if v is None:
+    n_params = weights.numel()
 
-        v = torch.randn_like(
-            weights
+    # --------------------------------------------------
+    # Initialize subspace
+    # --------------------------------------------------
+
+    if warm_U is None:
+
+        Q = torch.randn(
+            n_params,
+            n_eig,
+            device=weights.device,
+            dtype=weights.dtype,
         )
-
-        v = v / torch.norm(v)
 
     else:
 
-        v = v / torch.norm(v)
+        Q = warm_U.to(
+            weights.device
+        )
+
+        # Add random directions if needed.
+        if Q.shape[1] < n_eig:
+
+            extra = torch.randn(
+                n_params,
+                n_eig - Q.shape[1],
+                device=weights.device,
+                dtype=weights.dtype,
+            )
+
+            Q = torch.cat(
+                [
+                    Q,
+                    extra,
+                ],
+                dim=1,
+            )
+
+        elif Q.shape[1] > n_eig:
+
+            Q = Q[
+                :,
+                :n_eig,
+            ]
+
+    # Orthonormalize.
+    Q, _ = torch.linalg.qr(
+        Q,
+        mode="reduced",
+    )
+
+    # --------------------------------------------------
+    # Block power/subspace iterations
+    # --------------------------------------------------
 
     for _ in range(num_iters):
+
+        HQ_columns = []
+
+        for j in range(
+            Q.shape[1]
+        ):
+
+            hv = hessian_vector_product(
+                model=model,
+                weights=weights,
+                vector=Q[:, j],
+                x=x,
+                targets=targets,
+            )
+
+            HQ_columns.append(
+                hv
+            )
+
+        HQ = torch.stack(
+            HQ_columns,
+            dim=1,
+        )
+
+        Q, _ = torch.linalg.qr(
+            HQ,
+            mode="reduced",
+        )
+
+    # --------------------------------------------------
+    # Rayleigh-Ritz refinement
+    # --------------------------------------------------
+
+    HQ_columns = []
+
+    for j in range(
+        Q.shape[1]
+    ):
 
         hv = hessian_vector_product(
             model=model,
             weights=weights,
-            vector=v,
+            vector=Q[:, j],
             x=x,
             targets=targets,
-            create_graph=False,
-        ).detach()
+        )
 
-        norm = torch.norm(hv)
+        HQ_columns.append(
+            hv
+        )
 
-        if norm < 1e-12:
-            break
+    HQ = torch.stack(
+        HQ_columns,
+        dim=1,
+    )
 
-        v = hv / norm
+    small_H = (
+        Q.T @ HQ
+    )
 
-    hv = hessian_vector_product(
-        model=model,
-        weights=weights,
-        vector=v,
-        x=x,
-        targets=targets,
-        create_graph=False,
-    ).detach()
+    # Symmetrize.
+    small_H = 0.5 * (
+        small_H + small_H.T
+    )
 
-    eigenvalue = torch.dot(
-        v,
-        hv,
+    eigvals, eigvecs = (
+        torch.linalg.eigh(
+            small_H
+        )
+    )
+
+    order = torch.argsort(
+        eigvals,
+        descending=True,
+    )
+
+    eigvals = eigvals[
+        order
+    ]
+
+    eigvecs = eigvecs[
+        :,
+        order
+    ]
+
+    U = (
+        Q @ eigvecs
     )
 
     return (
-        eigenvalue.item(),
-        v.detach(),
+        eigvals.detach(),
+        U.detach(),
     )
 
 
-def sharpness_gradient(
+# ============================================================
+# THIRD DERIVATIVE
+# ============================================================
+
+
+def third_derivative_pair(
     model,
     weights,
-    eigenvector,
+    u,
+    v,
     x,
     targets,
 ):
     """
     Compute
 
-        grad_w [u^T H(w) u]
+        grad_w [u^T H(w) v]
 
-    treating u as fixed.
-
-    This is the third-derivative quantity needed
-    by Central Flow.
+    while treating u and v as fixed.
     """
 
     set_parameter_vector(
@@ -194,7 +333,10 @@ def sharpness_gradient(
         model.parameters()
     )
 
+    # --------------------------------------------------
     # First derivative
+    # --------------------------------------------------
+
     grads = torch.autograd.grad(
         loss,
         params,
@@ -202,42 +344,170 @@ def sharpness_gradient(
     )
 
     flat_grad = torch.cat(
-        [g.reshape(-1) for g in grads]
+        [
+            g.reshape(-1)
+            for g in grads
+        ]
     )
 
-    # H u
-    grad_dot_u = torch.dot(
+    # --------------------------------------------------
+    # H v
+    # --------------------------------------------------
+
+    grad_v = torch.dot(
         flat_grad,
-        eigenvector,
+        v,
     )
 
-    hv = torch.autograd.grad(
-        grad_dot_u,
+    Hv = torch.autograd.grad(
+        grad_v,
         params,
         create_graph=True,
     )
 
-    flat_hv = torch.cat(
-        [h.reshape(-1) for h in hv]
+    flat_Hv = torch.cat(
+        [
+            h.reshape(-1)
+            for h in Hv
+        ]
     )
 
-    # u^T H u
-    rayleigh = torch.dot(
-        eigenvector,
-        flat_hv,
+    # --------------------------------------------------
+    # u^T H v
+    # --------------------------------------------------
+
+    scalar = torch.dot(
+        u,
+        flat_Hv,
     )
 
-    # grad_w (u^T H u)
+    # --------------------------------------------------
+    # grad_w (u^T H v)
+    # --------------------------------------------------
+
     third = torch.autograd.grad(
-        rayleigh,
+        scalar,
         params,
     )
 
     q = torch.cat(
-        [t.reshape(-1) for t in third]
+        [
+            t.reshape(-1)
+            for t in third
+        ]
     )
 
     return q.detach()
+
+
+# ============================================================
+# SYMMETRIC MATRIX UTILITIES
+# ============================================================
+
+
+def upper_indices(
+    k,
+    device,
+):
+
+    return torch.triu_indices(
+        k,
+        k,
+        device=device,
+    )
+
+
+def symmetric_metric(
+    k,
+    device,
+    dtype,
+):
+    """
+    Entries corresponding to X_ii get weight 1.
+
+    Entries corresponding to X_ij, i != j,
+    get weight 2 because a symmetric matrix
+    contains both X_ij and X_ji.
+    """
+
+    i, j = upper_indices(
+        k,
+        device,
+    )
+
+    metric = torch.where(
+        i == j,
+        torch.ones_like(
+            i,
+            dtype=dtype,
+        ),
+        2.0
+        * torch.ones_like(
+            i,
+            dtype=dtype,
+        ),
+    )
+
+    return metric
+
+
+def upper_to_symmetric(
+    values,
+    k,
+):
+    """
+    Convert upper-triangular coordinates into
+    a symmetric k x k matrix.
+    """
+
+    device = values.device
+    dtype = values.dtype
+
+    i, j = upper_indices(
+        k,
+        device,
+    )
+
+    matrix = torch.zeros(
+        k,
+        k,
+        device=device,
+        dtype=dtype,
+    )
+
+    matrix[
+        i,
+        j,
+    ] = values
+
+    matrix[
+        j,
+        i,
+    ] = values
+
+    return matrix
+
+
+def symmetric_to_upper(
+    matrix,
+):
+
+    k = matrix.shape[0]
+
+    i, j = upper_indices(
+        k,
+        matrix.device,
+    )
+
+    return matrix[
+        i,
+        j,
+    ]
+
+
+# ============================================================
+# CENTRAL FLOW STEP
+# ============================================================
 
 
 def central_flow_substep(
@@ -247,164 +517,341 @@ def central_flow_substep(
     targets,
     eta,
     dt,
-    eigenvector=None,
-    eig_iters=10,
-    critical_factor=1.95,
+    sdcp_solver,
+    warm_U=None,
+    n_eig=6,
+    eig_iters=8,
+    track_threshold=1.5,
 ):
     """
-    One rank-1 Central Flow substep.
+    One multi-direction Central Flow substep.
 
-    If lambda < critical_factor / eta:
-        ordinary gradient flow.
+    Tracks all available Hessian eigenvalues above
 
-    Otherwise:
-        activate the oscillation covariance correction.
+        track_threshold / eta
+
+    and solves for a PSD oscillation covariance
+    in that critical subspace.
     """
+
+    # --------------------------------------------------
+    # Gradient
+    # --------------------------------------------------
 
     loss, gradient = loss_and_gradient(
         model=model,
         weights=weights,
         x=x,
         targets=targets,
-        create_graph=False,
     )
 
-    gradient = gradient.detach()
+    # --------------------------------------------------
+    # Hessian critical eigenspace
+    # --------------------------------------------------
 
-    eigenvalue, eigenvector = (
-        top_eigenpair_warmstart(
-            model=model,
-            weights=weights,
-            x=x,
-            targets=targets,
-            v=eigenvector,
-            num_iters=eig_iters,
-        )
+    eigvals, U = top_eigenspace(
+        model=model,
+        weights=weights,
+        x=x,
+        targets=targets,
+        n_eig=n_eig,
+        warm_U=warm_U,
+        num_iters=eig_iters,
     )
 
     critical_threshold = (
-        critical_factor / eta
+        track_threshold / eta
     )
 
-    stability_threshold = (
-        2.0 / eta
+    critical_mask = (
+        eigvals
+        > critical_threshold
+    )
+
+    critical_count = int(
+        critical_mask.sum().item()
     )
 
     # --------------------------------------------------
-    # Below critical region:
-    # Central Flow reduces to gradient flow
+    # Ordinary gradient flow if no critical direction
     # --------------------------------------------------
 
-    if eigenvalue <= critical_threshold:
+    stable_velocity = (
+        -eta
+        * gradient
+    )
 
-        velocity = (
-            -eta * gradient
-        )
-
-        sigma = 0.0
+    if critical_count == 0:
 
         new_weights = (
             weights
-            + dt * velocity
-        )
-
-        predicted_loss = (
-            loss.item()
+            + dt
+            * stable_velocity
         )
 
         return {
-            "weights": new_weights.detach(),
-            "eigenvector": eigenvector,
-            "eigenvalue": eigenvalue,
-            "sigma": sigma,
-            "loss": loss.item(),
-            "predicted_loss": predicted_loss,
+            "weights": (
+                new_weights.detach()
+            ),
+
+            "eigvals": (
+                eigvals.detach()
+            ),
+
+            "U": (
+                U.detach()
+            ),
+
+            "critical_count": 0,
+
+            "sigma_eigs": (
+                torch.zeros_like(
+                    eigvals
+                )
+            ),
+
+            "sigma_trace": 0.0,
+
+            "loss": loss,
         }
 
     # --------------------------------------------------
-    # Critical regime
+    # Critical eigenvectors
     # --------------------------------------------------
 
-    q = sharpness_gradient(
-        model=model,
-        weights=weights,
-        eigenvector=eigenvector,
-        x=x,
-        targets=targets,
-    )
+    crit_eigs = eigvals[
+        :critical_count
+    ]
 
-    # Stable gradient-flow component
-    dw_stable = (
-        -eta * gradient
-    )
+    crit_U = U[
+        :,
+        :critical_count
+    ]
 
-    # How sharpness changes under gradient flow
-    d_lambda_stable = torch.dot(
-        q,
-        dw_stable,
-    ).item()
+    k = critical_count
 
-    # Effect of covariance correction on motion
-    dw_sigma = (
-        -0.5 * eta * q
-    )
+    # --------------------------------------------------
+    # All unique (i,j) Hessian-pair derivatives
+    # --------------------------------------------------
 
-    # Effect of that correction on sharpness
-    d_lambda_sigma = (
-        -torch.dot(
-            q,
-            dw_sigma,
-        ).item()
-    )
-
-    # Predicted distance from the stability boundary
-    residual_stable = (
-        stability_threshold
-        - (
-            eigenvalue
-            + dt * d_lambda_stable
+    pair_i, pair_j = (
+        torch.triu_indices(
+            k,
+            k,
+            device=weights.device,
         )
     )
 
-    denominator = (
-        dt * d_lambda_sigma
-    )
+    q_vectors = []
 
-    # Rank-1 complementarity solution
-    if (
-        residual_stable < 0.0
-        and denominator > 1e-12
+    for a in range(
+        pair_i.numel()
     ):
 
-        sigma = (
-            -residual_stable
-            / denominator
+        i = pair_i[a].item()
+        j = pair_j[a].item()
+
+        q = third_derivative_pair(
+            model=model,
+            weights=weights,
+            u=crit_U[:, i],
+            v=crit_U[:, j],
+            x=x,
+            targets=targets,
         )
 
-    else:
+        q_vectors.append(
+            q
+        )
 
-        sigma = 0.0
+    # shape:
+    #
+    # m x num_parameters
+    #
+    # where m = k(k+1)/2
+    Q = torch.stack(
+        q_vectors,
+        dim=0,
+    )
+
+    metric = symmetric_metric(
+        k,
+        weights.device,
+        weights.dtype,
+    )
+
+    # --------------------------------------------------
+    # How Hessian changes under ordinary gradient flow
+    # --------------------------------------------------
+
+    dH_stable_upper = (
+        Q
+        @ stable_velocity
+    )
+
+    dH_stable = (
+        upper_to_symmetric(
+            dH_stable_upper,
+            k,
+        )
+    )
+
+    # --------------------------------------------------
+    # Residual to EOS boundary after stable motion
+    # --------------------------------------------------
+
+    I = torch.eye(
+        k,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+
+    predicted_H = (
+        torch.diag(
+            crit_eigs
+        )
+        + dt
+        * dH_stable
+    )
+
+    A = (
+        (2.0 / eta)
+        * I
+        - predicted_H
+    )
+
+    # --------------------------------------------------
+    # Build linear covariance-response operator
+    #
+    # velocity correction:
+    #
+    #   -eta/2 sum_ij X_ij q_ij
+    #
+    # in upper triangular coordinates.
+    # --------------------------------------------------
+
+    gram = (
+        Q @ Q.T
+    )
+
+    B_upper = (
+        dt
+        * eta
+        / 2.0
+        * gram
+        @ torch.diag(
+            metric
+        )
+    )
+
+    # --------------------------------------------------
+    # Solve PSD covariance
+    # --------------------------------------------------
+
+    X_np = sdcp_solver.solve(
+        A.detach()
+        .cpu()
+        .numpy(),
+
+        B_upper.detach()
+        .cpu()
+        .numpy(),
+    )
+
+    X = torch.tensor(
+        X_np,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+
+    X_upper = (
+        symmetric_to_upper(
+            X
+        )
+    )
+
+    # --------------------------------------------------
+    # Central Flow covariance correction
+    # --------------------------------------------------
+
+    correction_coefficients = (
+        metric
+        * X_upper
+    )
+
+    correction_velocity = (
+        -0.5
+        * eta
+        * (
+            Q.T
+            @ correction_coefficients
+        )
+    )
 
     velocity = (
-        dw_stable
-        + sigma * dw_sigma
+        stable_velocity
+        + correction_velocity
     )
 
     new_weights = (
         weights
-        + dt * velocity
+        + dt
+        * velocity
     )
 
-    predicted_loss = (
-        loss.item()
-        + sigma / eta
+    # --------------------------------------------------
+    # Covariance eigenvalues
+    # --------------------------------------------------
+
+    sigma_eigs_small = (
+        torch.linalg.eigvalsh(
+            X
+        )
+    )
+
+    sigma_eigs_small = torch.flip(
+        sigma_eigs_small,
+        dims=[0],
+    )
+
+    sigma_eigs = torch.zeros_like(
+        eigvals
+    )
+
+    sigma_eigs[
+        :k
+    ] = sigma_eigs_small
+
+    sigma_trace = (
+        torch.trace(X).item()
     )
 
     return {
-        "weights": new_weights.detach(),
-        "eigenvector": eigenvector,
-        "eigenvalue": eigenvalue,
-        "sigma": sigma,
-        "loss": loss.item(),
-        "predicted_loss": predicted_loss,
+        "weights": (
+            new_weights.detach()
+        ),
+
+        "eigvals": (
+            eigvals.detach()
+        ),
+
+        "U": (
+            U.detach()
+        ),
+
+        "critical_count": (
+            critical_count
+        ),
+
+        "sigma_eigs": (
+            sigma_eigs.detach()
+        ),
+
+        "sigma_trace": (
+            sigma_trace
+        ),
+
+        "loss": (
+            loss
+        ),
     }

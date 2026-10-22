@@ -16,7 +16,7 @@ from src.utils import set_parameter_vector
 START_STEP = 6000
 
 # Number of GD-equivalent steps to test
-NUM_FLOW_STEPS = 50
+NUM_FLOW_STEPS = 1000
 
 # Numerical integration step
 DT = 0.1

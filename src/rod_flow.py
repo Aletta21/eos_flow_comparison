@@ -309,12 +309,6 @@ def update_extent(
         V_aug @ eigvecs
     )
 
-    # Clean numerical drift
-    V_new, _ = torch.linalg.qr(
-        V_new,
-        mode="reduced",
-    )
-
     return V_new, eigvals
 
 
