@@ -1,48 +1,57 @@
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from src import config
-from src.central_flow import (
-    central_flow_substep,
-)
-from src.data import (
-    get_cifar10_subset,
-)
+from src.central_flow import central_flow_substep
+from src.data import get_cifar10_subset
 from src.model import MLP
 from src.sdcp import SDCPSolver
-from src.utils import (
-    set_parameter_vector,
-)
+from src.utils import set_parameter_vector
 
 
 # ============================================================
-# SETTINGS
+# Configuration
 # ============================================================
+
 
 START_STEP = 6000
 
-# Start small because the full CF is much more expensive.
+# Run from 6000 -> 7000
 NUM_FLOW_STEPS = 1000
 
-# Four substeps per GD-equivalent iteration.
+# Four Central Flow substeps per GD-equivalent step.
 NSUBSTEPS = 4
 
-DT = 1.0 / NSUBSTEPS
+DT = (
+    1.0 / NSUBSTEPS
+)
 
-# Track several Hessian directions.
+# Number of dominant Hessian directions tracked.
 N_EIG = 6
 
-# HVP block-iteration count.
+# Number of block power iterations.
 EIG_ITERS = 8
 
-# Official code tracks eigenvalues above a multiple of 1/eta.
+# Effective tracking threshold.
+#
+# Raw Hessian equivalent:
+#
+#     1.5 / eta
+#
 TRACK_THRESHOLD = 1.5
+
+# Effective SDCP / critical threshold.
+#
+# Raw Hessian equivalent:
+#
+#     1.95 / eta
+#
+SDCP_THRESHOLD = 1.95
 
 
 # ============================================================
-# GD HELPERS
+# Helpers
 # ============================================================
 
 
@@ -50,22 +59,20 @@ def get_saved_weight(
     gd_data,
     step,
 ):
+    """
+    Retrieve one stored GD parameter vector.
+    """
 
-    saved_steps = (
-        gd_data[
-            "saved_steps"
-        ]
-    )
+    saved_steps = gd_data[
+        "saved_steps"
+    ]
 
-    trajectory = (
-        gd_data[
-            "trajectory"
-        ]
-    )
+    trajectory = gd_data[
+        "trajectory"
+    ]
 
     matches = (
-        saved_steps
-        == step
+        saved_steps == step
     ).nonzero(
         as_tuple=True
     )[0]
@@ -73,8 +80,7 @@ def get_saved_weight(
     if len(matches) == 0:
 
         raise ValueError(
-            f"GD step {step} "
-            "is not stored."
+            f"GD step {step} is not stored."
         )
 
     return trajectory[
@@ -82,60 +88,8 @@ def get_saved_weight(
     ]
 
 
-def empirical_midpoint(
-    gd_data,
-    step,
-):
-
-    w0 = get_saved_weight(
-        gd_data,
-        step,
-    )
-
-    w1 = get_saved_weight(
-        gd_data,
-        step + 1,
-    )
-
-    return (
-        0.5
-        * (
-            w0 + w1
-        )
-    )
-
-
 # ============================================================
-# LOSS
-# ============================================================
-
-
-def loss_at_weights(
-    model,
-    weights,
-    x,
-    targets,
-):
-
-    set_parameter_vector(
-        model,
-        weights,
-    )
-
-    with torch.no_grad():
-
-        output = model(x)
-
-        loss = F.mse_loss(
-            output,
-            targets,
-        )
-
-    return loss.item()
-
-
-# ============================================================
-# MAIN
+# Main
 # ============================================================
 
 
@@ -149,59 +103,153 @@ def main():
         config.DEVICE
     )
 
-    # --------------------------------------------------
-    # Data
-    # --------------------------------------------------
-
-    x, y = get_cifar10_subset(
-        data_dir=config.DATA_DIR,
-        num_samples=config.NUM_SAMPLES,
+    print()
+    print(
+        "Loading data..."
     )
 
-    x = x.to(device)
-    y = y.to(device)
+    # --------------------------------------------------------
+    # Data
+    # --------------------------------------------------------
 
-    targets = F.one_hot(
-        y,
+    x, labels = get_cifar10_subset(
+        num_samples=config.NUM_SAMPLES,
+        data_dir=config.DATA_DIR,
+    )
+
+    x = x.to(
+        device
+    ).float()
+
+    labels = labels.to(
+        device
+    )
+
+    targets = torch.nn.functional.one_hot(
+        labels,
         num_classes=config.NUM_CLASSES,
     ).float()
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # GD trajectory
-    # --------------------------------------------------
+    # --------------------------------------------------------
+
+    gd_path = Path(
+        "outputs/trajectories/gd.pt"
+    )
 
     gd_data = torch.load(
-        "outputs/trajectories/gd.pt",
+        gd_path,
         map_location="cpu",
         weights_only=False,
     )
 
-    # Start CF from the actual GD state at t=6000.
+    # Central Flow starts at the actual GD iterate w_6000.
     weights = get_saved_weight(
         gd_data,
         START_STEP,
-    ).to(device)
-
-    # --------------------------------------------------
-    # Model
-    # --------------------------------------------------
-
-    model = MLP().to(device)
-
-    # --------------------------------------------------
-    # SDCP solver
-    # --------------------------------------------------
-
-    sdcp_solver = (
-        SDCPSolver()
+    ).to(
+        device
     )
 
-    # Previous eigenspace will be reused.
-    warm_U = None
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
 
-    # --------------------------------------------------
+    model = MLP().to(
+        device
+    )
+
+    set_parameter_vector(
+        model,
+        weights,
+    )
+
+    # --------------------------------------------------------
+    # SDCP solver
+    # --------------------------------------------------------
+
+    sdcp_solver = SDCPSolver()
+
+    # --------------------------------------------------------
+    # Threshold diagnostics
+    # --------------------------------------------------------
+
+    raw_track_threshold = (
+        TRACK_THRESHOLD
+        / config.LR
+    )
+
+    raw_sdcp_threshold = (
+        SDCP_THRESHOLD
+        / config.LR
+    )
+
+    eos_threshold = (
+        2.0
+        / config.LR
+    )
+
+    print()
+    print(
+        "Central Flow configuration"
+    )
+
+    print(
+        "--------------------------"
+    )
+
+    print(
+        f"Start step: {START_STEP}"
+    )
+
+    print(
+        f"Flow steps: {NUM_FLOW_STEPS}"
+    )
+
+    print(
+        f"Substeps per GD step: "
+        f"{NSUBSTEPS}"
+    )
+
+    print(
+        f"dt: {DT}"
+    )
+
+    print(
+        f"Tracked eigenvectors: "
+        f"{N_EIG}"
+    )
+
+    print()
+
+    print(
+        "Thresholds:"
+    )
+
+    print(
+        f"  tracking       = "
+        f"{TRACK_THRESHOLD:.2f} effective "
+        f"= {raw_track_threshold:.2f} raw"
+    )
+
+    print(
+        f"  SDCP critical  = "
+        f"{SDCP_THRESHOLD:.2f} effective "
+        f"= {raw_sdcp_threshold:.2f} raw"
+    )
+
+    print(
+        f"  EOS boundary   = "
+        f"2.00 effective "
+        f"= {eos_threshold:.2f} raw"
+    )
+
+    print()
+
+    # --------------------------------------------------------
     # Storage
-    # --------------------------------------------------
+    # --------------------------------------------------------
 
     centers = [
         weights.detach().cpu()
@@ -211,162 +259,81 @@ def main():
         START_STEP
     ]
 
-    distances = []
+    center_losses = []
 
-    top_eigenvalues = []
-
-    sigma_traces = []
+    eigenvalues = []
 
     critical_counts = []
 
-    center_losses = []
+    sigma_eigenvalues = []
 
-    all_eigenvalues = []
+    sigma_traces = []
 
-    # --------------------------------------------------
-    # Initial information
-    # --------------------------------------------------
+    # Warm-start eigenspace.
+    warm_U = None
 
-    print()
-    print(
-        "Full Central Flow initialisation"
-    )
-
-    print(
-        "--------------------------------"
-    )
-
-    print(
-        f"Start step: {START_STEP}"
-    )
-
-    print(
-        f"eta: {config.LR}"
-    )
-
-    print(
-        f"2/eta: "
-        f"{2.0 / config.LR}"
-    )
-
-    print(
-        f"Tracked eigenvectors: "
-        f"{N_EIG}"
-    )
-
-    print(
-        f"Critical threshold: "
-        f"{TRACK_THRESHOLD}/eta = "
-        f"{TRACK_THRESHOLD / config.LR}"
-    )
-
-    print(
-        f"Substeps per GD step: "
-        f"{NSUBSTEPS}"
-    )
-
-    print()
-
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # Integration
-    # --------------------------------------------------
+    # --------------------------------------------------------
+
+    print(
+        "Running Central Flow..."
+    )
+
+    print()
 
     for flow_step in range(
         1,
         NUM_FLOW_STEPS + 1,
     ):
 
-        latest = None
+        latest_result = None
+
+        # ----------------------------------------------------
+        # Central Flow substeps
+        # ----------------------------------------------------
 
         for _ in range(
             NSUBSTEPS
         ):
 
-            latest = (
-                central_flow_substep(
-                    model=model,
-                    weights=weights,
-                    x=x,
-                    targets=targets,
-                    eta=config.LR,
-                    dt=DT,
-                    sdcp_solver=sdcp_solver,
-                    warm_U=warm_U,
-                    n_eig=N_EIG,
-                    eig_iters=EIG_ITERS,
-                    track_threshold=(
-                        TRACK_THRESHOLD
-                    ),
-                )
+            result = central_flow_substep(
+                model=model,
+                weights=weights,
+                x=x,
+                targets=targets,
+                eta=config.LR,
+                dt=DT,
+                sdcp_solver=sdcp_solver,
+                warm_U=warm_U,
+                n_eig=N_EIG,
+                eig_iters=EIG_ITERS,
+                track_threshold=(
+                    TRACK_THRESHOLD
+                ),
+                sdcp_threshold=(
+                    SDCP_THRESHOLD
+                ),
             )
 
-            weights = (
-                latest[
-                    "weights"
-                ]
-            )
+            weights = result[
+                "weights"
+            ]
 
-            warm_U = (
-                latest[
-                    "U"
-                ]
-            )
+            warm_U = result[
+                "U"
+            ]
 
-        # --------------------------------------------------
-        # Corresponding GD step
-        # --------------------------------------------------
+            latest_result = result
+
+        # ----------------------------------------------------
+        # Store after one GD-equivalent unit
+        # ----------------------------------------------------
 
         gd_step = (
             START_STEP
             + flow_step
         )
-
-        # Central Flow models a smoothed/central path,
-        # so compare against the empirical GD midpoint.
-        gd_midpoint = empirical_midpoint(
-            gd_data,
-            gd_step,
-        ).to(device)
-
-        distance = torch.norm(
-            weights
-            - gd_midpoint
-        ).item()
-
-        center_loss = (
-            loss_at_weights(
-                model,
-                weights,
-                x,
-                targets,
-            )
-        )
-
-        eigvals = (
-            latest[
-                "eigvals"
-            ]
-        )
-
-        top_lambda = (
-            eigvals[0].item()
-        )
-
-        sigma_trace = (
-            latest[
-                "sigma_trace"
-            ]
-        )
-
-        critical_count = (
-            latest[
-                "critical_count"
-            ]
-        )
-
-        # --------------------------------------------------
-        # Store
-        # --------------------------------------------------
 
         centers.append(
             weights.detach().cpu()
@@ -376,64 +343,106 @@ def main():
             gd_step
         )
 
-        distances.append(
-            distance
-        )
-
-        top_eigenvalues.append(
-            top_lambda
-        )
-
-        sigma_traces.append(
-            sigma_trace
-        )
-
-        critical_counts.append(
-            critical_count
-        )
-
         center_losses.append(
-            center_loss
-        )
-
-        all_eigenvalues.append(
-            eigvals.detach().cpu()
-        )
-
-        # --------------------------------------------------
-        # Print
-        # --------------------------------------------------
-
-        eig_string = ", ".join(
-            [
-                f"{value:.2f}"
-                for value
-                in eigvals.tolist()
+            latest_result[
+                "loss"
             ]
         )
 
-        print(
-            f"Step {gd_step:4d} | "
-            f"distance = "
-            f"{distance:.6e} | "
-            f"lambda1 = "
-            f"{top_lambda:.4f} | "
-            f"critical = "
-            f"{critical_count} | "
-            f"trace(Sigma) = "
-            f"{sigma_trace:.6e} | "
-            f"loss = "
-            f"{center_loss:.6f}"
+        eigenvalues.append(
+            latest_result[
+                "eigvals"
+            ].detach().cpu()
+        )
+
+        critical_counts.append(
+            latest_result[
+                "critical_count"
+            ]
+        )
+
+        sigma_eigenvalues.append(
+            latest_result[
+                "sigma_eigs"
+            ].detach().cpu()
+        )
+
+        sigma_traces.append(
+            latest_result[
+                "sigma_trace"
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
+
+        top_eigs = latest_result[
+            "eigvals"
+        ]
+
+        eig_string = (
+            ", ".join(
+                f"{value.item():.2f}"
+                for value in top_eigs[
+                    :min(
+                        6,
+                        len(top_eigs),
+                    )
+                ]
+            )
         )
 
         print(
-            f"           eigs = "
-            f"[{eig_string}]"
+            f"Step {gd_step} "
+            f"| eigs [{eig_string}] "
+            f"| critical="
+            f"{latest_result['critical_count']} "
+            f"| trace(Sigma)="
+            f"{latest_result['sigma_trace']:.6e} "
+            f"| loss="
+            f"{latest_result['loss']:.6f}"
         )
 
-    # --------------------------------------------------
-    # Save results
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Stack results
+    # --------------------------------------------------------
+
+    centers = torch.stack(
+        centers
+    )
+
+    steps = torch.tensor(
+        steps,
+        dtype=torch.long,
+    )
+
+    center_losses = torch.tensor(
+        center_losses,
+        dtype=torch.float32,
+    )
+
+    eigenvalues = torch.stack(
+        eigenvalues
+    )
+
+    critical_counts = torch.tensor(
+        critical_counts,
+        dtype=torch.long,
+    )
+
+    sigma_eigenvalues = torch.stack(
+        sigma_eigenvalues
+    )
+
+    sigma_traces = torch.tensor(
+        sigma_traces,
+        dtype=torch.float32,
+    )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
 
     output_dir = Path(
         "outputs/trajectories"
@@ -451,66 +460,49 @@ def main():
 
     torch.save(
         {
-            "steps": torch.tensor(
-                steps,
-                dtype=torch.long,
-            ),
-
-            "centers": torch.stack(
-                centers
-            ),
-
-            "distances_to_gd": (
-                torch.tensor(
-                    distances,
-                    dtype=torch.float32,
-                )
-            ),
-
-            "eigenvalues": (
-                torch.tensor(
-                    top_eigenvalues,
-                    dtype=torch.float32,
-                )
-            ),
-
-            # Keep this name for compatibility
-            # with the old plotting code.
-            "sigmas": torch.tensor(
-                sigma_traces,
-                dtype=torch.float32,
-            ),
-
-            "critical_counts": (
-                torch.tensor(
-                    critical_counts,
-                    dtype=torch.long,
-                )
-            ),
-
+            "steps": steps,
+            "centers": centers,
             "center_losses": (
-                torch.tensor(
-                    center_losses,
-                    dtype=torch.float32,
-                )
+                center_losses
             ),
-
-            "all_eigenvalues": (
-                torch.stack(
-                    all_eigenvalues
-                )
+            "eigenvalues": (
+                eigenvalues
             ),
-
+            "critical_counts": (
+                critical_counts
+            ),
+            "sigma_eigenvalues": (
+                sigma_eigenvalues
+            ),
+            "sigma_traces": (
+                sigma_traces
+            ),
             "start_step": (
                 START_STEP
             ),
-
-            "dt": DT,
-
-            "n_eig": N_EIG,
-
+            "num_flow_steps": (
+                NUM_FLOW_STEPS
+            ),
+            "nsubsteps": (
+                NSUBSTEPS
+            ),
+            "dt": (
+                DT
+            ),
+            "n_eig": (
+                N_EIG
+            ),
+            "eig_iters": (
+                EIG_ITERS
+            ),
             "track_threshold": (
                 TRACK_THRESHOLD
+            ),
+            "sdcp_threshold": (
+                SDCP_THRESHOLD
+            ),
+            "eta": (
+                config.LR
             ),
         },
         output_path,
@@ -518,11 +510,12 @@ def main():
 
     print()
     print(
-        "Saved full Central Flow test to:"
+        "Central Flow finished."
     )
 
     print(
-        output_path
+        f"Saved trajectory to: "
+        f"{output_path}"
     )
 
 

@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn.functional as F
 
@@ -17,6 +15,10 @@ def loss_and_gradient(
     x,
     targets,
 ):
+    """
+    Full-batch loss and gradient at a flattened
+    parameter vector.
+    """
 
     set_parameter_vector(
         model,
@@ -66,6 +68,10 @@ def hessian_vector_product(
     x,
     targets,
 ):
+    """
+    Compute H(weights) @ vector without explicitly
+    constructing the full Hessian.
+    """
 
     set_parameter_vector(
         model,
@@ -135,11 +141,11 @@ def top_eigenspace(
     """
     HVP-based block subspace iteration.
 
-    This tracks several dominant Hessian eigendirections
+    Tracks several dominant Hessian eigen-directions
     simultaneously.
 
-    warm_U lets us reuse the previous Central Flow
-    eigenspace as initialization.
+    warm_U allows the previous eigenspace to be reused
+    as initialization.
     """
 
     n_params = weights.numel()
@@ -188,17 +194,19 @@ def top_eigenspace(
                 :n_eig,
             ]
 
-    # Orthonormalize.
+    # Initial orthonormalization.
     Q, _ = torch.linalg.qr(
         Q,
         mode="reduced",
     )
 
     # --------------------------------------------------
-    # Block power/subspace iterations
+    # Block power / subspace iterations
     # --------------------------------------------------
 
-    for _ in range(num_iters):
+    for _ in range(
+        num_iters
+    ):
 
         HQ_columns = []
 
@@ -259,15 +267,14 @@ def top_eigenspace(
         Q.T @ HQ
     )
 
-    # Symmetrize.
+    # Protect against small numerical asymmetries.
     small_H = 0.5 * (
-        small_H + small_H.T
+        small_H
+        + small_H.T
     )
 
-    eigvals, eigvecs = (
-        torch.linalg.eigh(
-            small_H
-        )
+    eigvals, eigvecs = torch.linalg.eigh(
+        small_H
     )
 
     order = torch.argsort(
@@ -409,7 +416,6 @@ def upper_indices(
     k,
     device,
 ):
-
     return torch.triu_indices(
         k,
         k,
@@ -423,11 +429,11 @@ def symmetric_metric(
     dtype,
 ):
     """
-    Entries corresponding to X_ii get weight 1.
+    Entries corresponding to X_ii have weight 1.
 
-    Entries corresponding to X_ij, i != j,
-    get weight 2 because a symmetric matrix
-    contains both X_ij and X_ji.
+    Entries corresponding to X_ij, i != j, have
+    weight 2 because the symmetric matrix contains
+    both X_ij and X_ji.
     """
 
     i, j = upper_indices(
@@ -491,6 +497,10 @@ def upper_to_symmetric(
 def symmetric_to_upper(
     matrix,
 ):
+    """
+    Extract upper-triangular coordinates from
+    a symmetric matrix.
+    """
 
     k = matrix.shape[0]
 
@@ -522,16 +532,30 @@ def central_flow_substep(
     n_eig=6,
     eig_iters=8,
     track_threshold=1.5,
+    sdcp_threshold=1.95,
 ):
     """
     One multi-direction Central Flow substep.
 
-    Tracks all available Hessian eigenvalues above
+    Two thresholds are kept separate:
 
         track_threshold / eta
 
-    and solves for a PSD oscillation covariance
-    in that critical subspace.
+    describes the broader high-curvature region that
+    we want the eigensolver to track.
+
+    The actual SDCP critical subspace uses
+
+        sdcp_threshold / eta.
+
+    For eta = 0.025:
+
+        tracking threshold = 1.5 / eta = 60
+        SDCP threshold     = 1.95 / eta = 78
+        EOS boundary       = 2.0 / eta = 80
+
+    Only eigen-directions above the SDCP threshold enter
+    the covariance correction.
     """
 
     # --------------------------------------------------
@@ -546,7 +570,7 @@ def central_flow_substep(
     )
 
     # --------------------------------------------------
-    # Hessian critical eigenspace
+    # Dominant Hessian eigenspace
     # --------------------------------------------------
 
     eigvals, U = top_eigenspace(
@@ -559,9 +583,23 @@ def central_flow_substep(
         num_iters=eig_iters,
     )
 
-    critical_threshold = (
+    # --------------------------------------------------
+    # Thresholds
+    # --------------------------------------------------
+
+    tracking_threshold_raw = (
         track_threshold / eta
     )
+
+    critical_threshold = (
+        sdcp_threshold / eta
+    )
+
+    # top_eigenspace currently always returns n_eig
+    # directions. tracking_threshold_raw is retained
+    # explicitly because tracking and SDCP thresholds
+    # are conceptually different.
+    _ = tracking_threshold_raw
 
     critical_mask = (
         eigvals
@@ -573,13 +611,18 @@ def central_flow_substep(
     )
 
     # --------------------------------------------------
-    # Ordinary gradient flow if no critical direction
+    # Ordinary gradient flow velocity
     # --------------------------------------------------
 
     stable_velocity = (
         -eta
         * gradient
     )
+
+    # --------------------------------------------------
+    # No critical direction:
+    # ordinary gradient flow
+    # --------------------------------------------------
 
     if critical_count == 0:
 
@@ -593,25 +636,19 @@ def central_flow_substep(
             "weights": (
                 new_weights.detach()
             ),
-
             "eigvals": (
                 eigvals.detach()
             ),
-
             "U": (
                 U.detach()
             ),
-
             "critical_count": 0,
-
             "sigma_eigs": (
                 torch.zeros_like(
                     eigvals
                 )
             ),
-
             "sigma_trace": 0.0,
-
             "loss": loss,
         }
 
@@ -619,6 +656,8 @@ def central_flow_substep(
     # Critical eigenvectors
     # --------------------------------------------------
 
+    # Eigenvalues are sorted descending, therefore
+    # all values above the threshold appear first.
     crit_eigs = eigvals[
         :critical_count
     ]
@@ -634,12 +673,10 @@ def central_flow_substep(
     # All unique (i,j) Hessian-pair derivatives
     # --------------------------------------------------
 
-    pair_i, pair_j = (
-        torch.triu_indices(
-            k,
-            k,
-            device=weights.device,
-        )
+    pair_i, pair_j = torch.triu_indices(
+        k,
+        k,
+        device=weights.device,
     )
 
     q_vectors = []
@@ -664,7 +701,7 @@ def central_flow_substep(
             q
         )
 
-    # shape:
+    # Shape:
     #
     # m x num_parameters
     #
@@ -681,7 +718,7 @@ def central_flow_substep(
     )
 
     # --------------------------------------------------
-    # How Hessian changes under ordinary gradient flow
+    # Hessian change caused by ordinary gradient flow
     # --------------------------------------------------
 
     dH_stable_upper = (
@@ -689,15 +726,13 @@ def central_flow_substep(
         @ stable_velocity
     )
 
-    dH_stable = (
-        upper_to_symmetric(
-            dH_stable_upper,
-            k,
-        )
+    dH_stable = upper_to_symmetric(
+        dH_stable_upper,
+        k,
     )
 
     # --------------------------------------------------
-    # Residual to EOS boundary after stable motion
+    # Residual to EOS boundary
     # --------------------------------------------------
 
     I = torch.eye(
@@ -714,20 +749,29 @@ def central_flow_substep(
         * dH_stable
     )
 
+    # EOS condition:
+    #
+    # H <= (2 / eta) I
     A = (
         (2.0 / eta)
         * I
         - predicted_H
     )
 
+    # Symmetrize for numerical robustness.
+    A = 0.5 * (
+        A
+        + A.T
+    )
+
     # --------------------------------------------------
     # Build linear covariance-response operator
     #
-    # velocity correction:
+    # Correction velocity:
     #
     #   -eta/2 sum_ij X_ij q_ij
     #
-    # in upper triangular coordinates.
+    # in upper-triangular coordinates.
     # --------------------------------------------------
 
     gram = (
@@ -764,10 +808,14 @@ def central_flow_substep(
         dtype=weights.dtype,
     )
 
-    X_upper = (
-        symmetric_to_upper(
-            X
-        )
+    # Numerical symmetrization.
+    X = 0.5 * (
+        X
+        + X.T
+    )
+
+    X_upper = symmetric_to_upper(
+        X
     )
 
     # --------------------------------------------------
@@ -803,10 +851,8 @@ def central_flow_substep(
     # Covariance eigenvalues
     # --------------------------------------------------
 
-    sigma_eigs_small = (
-        torch.linalg.eigvalsh(
-            X
-        )
+    sigma_eigs_small = torch.linalg.eigvalsh(
+        X
     )
 
     sigma_eigs_small = torch.flip(
@@ -822,35 +868,29 @@ def central_flow_substep(
         :k
     ] = sigma_eigs_small
 
-    sigma_trace = (
-        torch.trace(X).item()
-    )
+    sigma_trace = torch.trace(
+        X
+    ).item()
 
     return {
         "weights": (
             new_weights.detach()
         ),
-
         "eigvals": (
             eigvals.detach()
         ),
-
         "U": (
             U.detach()
         ),
-
         "critical_count": (
             critical_count
         ),
-
         "sigma_eigs": (
             sigma_eigs.detach()
         ),
-
         "sigma_trace": (
             sigma_trace
         ),
-
         "loss": (
             loss
         ),

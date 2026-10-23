@@ -138,52 +138,153 @@ def get_delta(V, lambdas):
     )
 
 
-def orthogonal_component(vector, V):
+def orthogonal_component(
+    vector,
+    V,
+):
     """
-    Component of vector orthogonal to
-    the columns of V.
+    Compute the component of `vector`
+    orthogonal to the columns of V.
+
+    Uses two-pass modified Gram-Schmidt
+    for better numerical stability.
     """
 
     if V.shape[1] == 0:
         return vector
 
-    projection = V @ (
-        V.T @ vector
-    )
+    result = vector.clone()
 
-    return vector - projection
+    # Two passes greatly reduce loss of
+    # orthogonality in float32.
+    for _ in range(2):
+        coefficients = (
+            V.T @ result
+        )
+
+        result = (
+            result
+            - V @ coefficients
+        )
+
+    return result
 
 
 def add_direction(
     V,
     direction,
-    eps=1e-10,
+    relative_tol=1e-6,
 ):
     """
-    Add a normalized direction to V
-    if it contains a meaningful component
+    Add a normalized direction only if it
+    contains a numerically meaningful component
     outside the current span.
+
+    Assumes columns of V are already orthonormal.
     """
 
-    direction = orthogonal_component(
+    original_norm = torch.norm(
+        direction
+    )
+
+    if original_norm <= 1e-12:
+        return V
+
+    residual = orthogonal_component(
         direction,
         V,
     )
 
-    norm = torch.norm(direction)
+    residual_norm = torch.norm(
+        residual
+    )
 
-    if norm <= eps:
+    # Do not normalize numerical noise.
+    if (
+        residual_norm
+        <= relative_tol * original_norm
+    ):
         return V
 
-    direction = (
-        direction / norm
+    new_direction = (
+        residual / residual_norm
     ).unsqueeze(1)
 
     return torch.cat(
-        [V, direction],
+        [
+            V,
+            new_direction,
+        ],
         dim=1,
     )
 
+def stabilize_extent(
+    V,
+    lambdas,
+    rank,
+):
+    """
+    Re-orthonormalize the low-rank representation
+
+        Sigma = V diag(lambdas) V^T
+
+    without changing Sigma.
+    """
+
+    # V = Q R
+    Q, R = torch.linalg.qr(
+        V,
+        mode="reduced",
+    )
+
+    # Transform covariance into Q basis:
+    #
+    # Sigma
+    # = V diag(lambda) V^T
+    # = Q [R diag(lambda) R^T] Q^T
+    small_cov = (
+        R
+        @ torch.diag(lambdas)
+        @ R.T
+    )
+
+    # Symmetrize against numerical drift
+    small_cov = 0.5 * (
+        small_cov
+        + small_cov.T
+    )
+
+    eigvals, eigvecs = torch.linalg.eigh(
+        small_cov
+    )
+
+    order = torch.argsort(
+        eigvals,
+        descending=True,
+    )
+
+    keep = order[:rank]
+
+    eigvals = torch.clamp(
+        eigvals[keep],
+        min=0.0,
+    )
+
+    eigvecs = eigvecs[
+        :,
+        keep,
+    ]
+
+    V_stable = (
+        Q @ eigvecs
+    )
+
+    
+
+    return (
+        V_stable,
+        eigvals,
+    )
 
 def update_extent(
     V,
@@ -307,6 +408,19 @@ def update_extent(
 
     V_new = (
         V_aug @ eigvecs
+    )
+
+    # --------------------------------------------------
+    # Numerical stabilization
+    #
+    # Preserve Sigma exactly while restoring an
+    # orthonormal low-rank basis.
+    # --------------------------------------------------
+
+    V_new, eigvals = stabilize_extent(
+        V_new,
+        eigvals,
+        rank=rank,
     )
 
     return V_new, eigvals

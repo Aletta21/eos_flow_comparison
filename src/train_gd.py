@@ -81,19 +81,9 @@ def run_gd(
         # -------------------------
 
         should_save = (
-            (
-                current_step < 5500
-                and current_step % 500 == 0
-            )
-            or
-            (
-                5500 <= current_step <= 7500
-            )
-            or
-            (
-                current_step > 7500
-                and current_step % 500 == 0
-            )
+            (current_step < 5900 and current_step % 500 == 0)
+            or (5900 <= current_step <= 7001)
+            or (current_step > 7001 and current_step % 500 == 0)
         )
 
         if should_save:
